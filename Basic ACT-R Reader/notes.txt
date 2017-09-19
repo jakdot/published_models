@@ -1,0 +1,5 @@
+The file parametersearch_MPI.py searches for parameter values in the data set summed_eyetracking_parameter_search.csv using Metropolis algorithm.
+
+The file checkfound_MPI.py simulates reading on the data set summed_eyetracking_parameter_search.csv.
+
+Both csv files come from GECO corpus.
