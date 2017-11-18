@@ -29,15 +29,21 @@ import matplotlib.pyplot as pp
 warnings.filterwarnings(action="ignore", category=UserWarning)
 
 MATERIALS = "materials_final.csv"
-#DATA = "small_eyetracking.csv" #testing
 DATA = "summed_eyetracking_not_search.csv" #this is a file which ignores sentences with ...
+
+#########info needed for calculation of activation##########
 
 SEC_IN_YEAR = 365*24*3600
 SEC_IN_TIME = 15*SEC_IN_YEAR
 
-USED_WORDS = 112.5
+USED_WORDS = 112.5 #number of words in the corpus from which frequencies are taken (in millions)
+
+###########parameters for ACT-R##################
 
 DECAY = 0.5
+RETRIEVAL_THRESHOLD = -50 #low number so that retrieval never fails (could be changed later)
+OPTIMIZED_LEARNING = False #parameter, often used in ACT-R, that speeds up base-level calculation, B; we don't need it because we will calculate B directly here, not case by case in pyactr; therefore, for every word, calculation is done only once
+EMMA_NOISE = False #do we want to assume landing and timing estimates in the EMMA eye mvt model to be deterministic, or noisy?
 
 def load_texts(lfile=MATERIALS):
     """
@@ -54,30 +60,16 @@ def load_file(lfile, index_col=None, sep=","):
     csvfile = pd.read_csv(lfile, index_col=index_col, header=0, sep=sep)
     return csvfile
 
+##############ACT-R model, basics#####################
+
 environment = actr.Environment(size=(1366, 768), focus_position=(0, 0))
 
 actr.chunktype("read", "state word")
 actr.chunktype("parsing", "top")
 actr.chunktype("word", "form cat")
 
-parser = actr.ACTRModel(environment, subsymbolic=True, optimized_learning=False, retrieval_threshold=-50, decay=DECAY, emma_noise=False, emma_landing_site_noise=False) #emma noise - True; to test word skipping
-
-#parser.productionstring(name="find probe", string="""
-#        =g>
-#        isa     read
-#        state   start
-#        ?visual_location>
-#        state   free
-#        buffer  empty
-#        ==>
-#        =g>
-#        isa     goal
-#        state   start
-#        ?visual_location>
-#        attended False
-#        +visual_location>
-#        isa _visuallocation
-#        screen_x closest""") #this rule is used if automatic visual search does not put anything in the buffer
+#the model with basic parameters set up
+parser = actr.ACTRModel(environment, subsymbolic=True, optimized_learning=OPTIMIZED_LEARNING, retrieval_threshold=RETRIEVAL_THRESHOLD, decay=DECAY, emma_noise=EMMA_NOISE, emma_landing_site_noise=EMMA_NOISE)
 
 parser.productionstring(name="attend word", string="""
         =g>
@@ -116,28 +108,27 @@ parser.productionstring(name="retrieve word", string="""
         isa         word
         form        =val""")
         
-#pd.set_option('mode.chained_assignment',None) #we are setting a value in a copy so we'd get warnings; they don't matter (since we won't use grouped/worksheet later, so we can switch the warning off
-
 def reading(grouped, rank, declchunks):
     """
     Main function, running reading. 
     """
 
-    for name, group in grouped:
+    for name, group in grouped: #name is name of the sentence in materials, group = sentence
 
         #print(name)
 
         stimulus = {}
         stimuli = []
-        old_utilitites = {}
      
-        y_position = 0 #to check if some text appears on the same screen or not
+        y_position = 0 #this will check if some text appears on the same screen or not
 
         freq = {}
 
         positions = {}
 
         lastwords = {} #storing last words in each line
+
+        #the following loop runs through a sentence word by word and creates a stimulus out of the sentence, recording the exact position; it also stores each word in decl. memory with the correct activation
 
         for idx, i in enumerate(group.index):
             if group.IA_TOP[i] < y_position:
@@ -160,6 +151,8 @@ def reading(grouped, rank, declchunks):
                 chunk_times = np.arange(start=-time_interval, stop=-(time_interval*word_freq)-1, step=-time_interval)
                 declchunks[actr.makechunk("", typename="word", form=word, cat=pos)] = math.log(np.sum((0-chunk_times) ** (-DECAY)))
             y_position = group.IA_TOP[i]
+
+        #the following 2 rules signal whether the reader should move to a new line or not depending on the x position
 
         for y in lastwords:
             tempstring = "\
@@ -212,6 +205,8 @@ def reading(grouped, rank, declchunks):
 
             parser.productionstring(name="move eyes to a new line" + y, string=tempstring)
 
+        #in the following part, the parser is made ready for reading - modules and buffers are initialized, focus is placed on the 1st word in sentence
+
         stimuli.append(stimulus)
 
         parser.decmems = {}
@@ -237,52 +232,54 @@ def reading(grouped, rank, declchunks):
                 isa     parsing
                 top     None"""))
         parser.goals["g2"].delay = 0.2
-    
+
+        #simulation is started
         sim = parser.simulation(realtime=False, trace=False, gui=True, environment_process=environment.environment_process, stimuli=stimuli, triggers='A', times=100)
-    
+
+        #variables that are used in recording eye fixation times are initialized    
         last_time = 0
-    
         cf = tuple(environment.current_focus)
-
-        first_word = True
-
         generated_list = []
 
+        #we'll run a loop in which we proceed event by event; we record eye fixation times (by recording the time until cf (eye focus) changes)); any break signals the end of simulation; break could arise not only when the sentence is finished; it could also arise if something went wrong, e.g., if time was higher than 100 seconds (if, for example, parameter values were very high) or if deck of events got empty
         while True:
-                if sim.show_time() > 100:
-                    generated_list = [len(group.WORD) - 2] + [0] * (len(group.WORD) - 2) #0 if getting stuck
-                    break
-                try:
-                    sim.step()
-                except (EmptySchedule, OverflowError):
-                    generated_list = [len(group.WORD) - 2] + [10000] * (len(group.WORD) - 2) #10000 if not finishing or overflowing (too much time)
-                    break
-                if not positions:
-                    break
-                if cf[0] != environment.current_focus[0] or cf[1] != environment.current_focus[1]:
-                    positions[cf][1] = 1000*(sim.show_time() - last_time) #time in milliseconds
-                    last_time = sim.show_time()
-                    cf = tuple(environment.current_focus)
-                if cf == last_position:
-                    break
+            if sim.show_time() > 100:
+                generated_list = [len(group.WORD) - 2] + [0] * (len(group.WORD) - 2) #0 if getting stuck
+                break
+            try:
+                #next event
+                sim.step()
+                #print(sim.current_event)
+            except (EmptySchedule, OverflowError):
+                generated_list = [len(group.WORD) - 2] + [10000] * (len(group.WORD) - 2) #10000 if not finishing or overflowing (too much time)
+                break
+            if not positions:
+                break
+            if cf[0] != environment.current_focus[0] or cf[1] != environment.current_focus[1]:
+                positions[cf][1] = 1000*(sim.show_time() - last_time) #time in milliseconds
+                last_time = sim.show_time()
+                cf = tuple(environment.current_focus)
+            if cf == last_position:
+                break
         if not generated_list:
-            ordered_keys = sorted(list(positions), key=lambda x:positions[x][0])
+            ordered_keys = sorted(list(positions), key=lambda x:positions[x][0]) #keys ordered from first word to last word
             generated_list = [len(group.WORD)-2] + [positions[x][1] for x in ordered_keys][1:-1] #first and last words ignored
         assert len(generated_list) == len(group.WORD) - 1, "In %s, the length of generated RTs would be %s, expected number of words is %s. This is illegal mismatch" %(name, len(generated_list) + 1, len(group.WORD))
         comm.Send(bytearray(name, 'utf-8'), dest=0, tag=0)
         sent_list = np.array(generated_list, dtype=np.float)
         comm.Send([sent_list, MPI.FLOAT], dest=0, tag=1)
 
+    #when we are done with all simulations, we send info to the master
     comm.Send(bytearray('DONE', 'utf-8'), dest=0, tag=0)
 
     return declchunks
 
 def repeated_reading(grouped, rank):
     """
-    For slaves: when receiving True from master, start reading.
+    Function for slaves: when receiving True from master, start reading.
     """
 
-    declchunks = {} #storing chunks, moved later to decl. mem
+    declchunks = {} #this variable stores all chunks in declarative memory; this speeds up simulation since words that were created once do not have to be re-created again
 
     while True:
         received_list = np.empty(3, dtype=np.float)
@@ -351,17 +348,24 @@ if rank == 0: #master
     #following values come from parametersearch done doing Metropolis -- see file parametersearch_MPI.py
     lf = 0.0001
     le = 0.36
-    emap = 1.17
+    emap = 1.15
 
+    print("Simulation for parameters lf, le, emap")
+    print("Number of sentences simulated: ", str(n_sentences))
+
+    #we will run 14 simulations (to match the GECO data, which had 14 English speakers)
     for i in range(14):
 
+        #record reaction times (eye fixations) on the words
         rt = model(lf, le, emap)
 
         value = str(i) + "LF" +  str(lf) + "LE" + str(le)  + "EMAP" + str(emap)
 
+        #store the simulation as series
         data[value] = pd.Series(rt)
 
-        data.to_csv("NONRANDoutput_simulation.csv", sep=",", encoding="utf-8", index=False)
+        #save the result as csv
+        data.to_csv("output_simulation.csv", sep=",", encoding="utf-8", index=False)
 
     #stop slaves from work
     sent_list = np.array([-1, -1, -1], dtype = np.float)

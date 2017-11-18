@@ -3,8 +3,9 @@ ACT-R basic reader. This does not do any parsing, it just sees a word, retrieves
 
 It searches for parameters.
 
-It that the location of the last word in each line is known (it is stored as an extra column in the analyzed dataset). This simplifies production rules, and in particular, shift to a new line.
+The location of the last word in each line is known (it is stored as an extra column in the analyzed dataset). This simplifies production rules, and in particular, shift to a new line.
 
+Running the file requires MPI.
 """
 
 import warnings
@@ -29,18 +30,29 @@ import matplotlib.pyplot as pp
 
 warnings.filterwarnings(action="ignore", category=UserWarning)
 
-MATERIALS = "materials_final.csv"
-#DATA = "small_eyetracking.csv" #testing
-DATA = "summed_eyetracking_parameter_search.csv" #this is a file which ignores sentences with ...
+#########files##########
 
-COUNT = 0
+MATERIALS = "materials_final.csv"
+DATA = "summed_eyetracking_parameter_search.csv"
+
+#########info needed for calculation of activation##########
 
 SEC_IN_YEAR = 365*24*3600
 SEC_IN_TIME = 15*SEC_IN_YEAR
 
-USED_WORDS = 112.5
+USED_WORDS = 112.5 #number of words in the corpus from which frequencies are taken (in millions)
+
+###########parameters for ACT-R##################
 
 DECAY = 0.5
+RETRIEVAL_THRESHOLD = -50 #low number so that retrieval never fails (could be changed later)
+OPTIMIZED_LEARNING = False #parameter, often used in ACT-R, that speeds up base-level calculation, B; we don't need it because we will calculate B directly here, not case by case in pyactr; therefore, for every word, calculation is done only once
+EMMA_NOISE = False #do we want to assume landing and timing estimates in the EMMA eye mvt model to be deterministic, or noisy?
+
+#############parameters for sampling##################
+    
+NDRAWS = 100 #how many draws?
+CHAIN = 0 #chain number
 
 def load_texts(lfile=MATERIALS):
     """
@@ -57,30 +69,16 @@ def load_file(lfile, index_col=None, sep=","):
     csvfile = pd.read_csv(lfile, index_col=index_col, header=0, sep=sep)
     return csvfile
 
+##############ACT-R model, basics#####################
+
 environment = actr.Environment(size=(1366, 768), focus_position=(0, 0))
 
 actr.chunktype("read", "state word")
 actr.chunktype("parsing", "top")
 actr.chunktype("word", "form cat")
 
-parser = actr.ACTRModel(environment, subsymbolic=True, optimized_learning=False, retrieval_threshold=-50, decay=DECAY, emma_noise=False, emma_landing_site_noise=False)
-
-#parser.productionstring(name="find probe", string="""
-#        =g>
-#        isa     read
-#        state   start
-#        ?visual_location>
-#        state   free
-#        buffer  empty
-#        ==>
-#        =g>
-#        isa     goal
-#        state   start
-#        ?visual_location>
-#        attended False
-#        +visual_location>
-#        isa _visuallocation
-#        screen_x closest""") #this rule is used if automatic visual search does not put anything in the buffer
+#the model with basic parameters set up
+parser = actr.ACTRModel(environment, subsymbolic=True, optimized_learning=OPTIMIZED_LEARNING, retrieval_threshold=RETRIEVAL_THRESHOLD, decay=DECAY, emma_noise=EMMA_NOISE, emma_landing_site_noise=EMMA_NOISE)
 
 parser.productionstring(name="attend word", string="""
         =g>
@@ -119,28 +117,27 @@ parser.productionstring(name="retrieve word", string="""
         isa         word
         form        =val""")
         
-#pd.set_option('mode.chained_assignment',None) #we are setting a value in a copy so we'd get warnings; they don't matter (since we won't use grouped/worksheet later, so we can switch the warning off
-
 def reading(grouped, rank, declchunks):
     """
     Main function, running reading. 
     """
 
-    for name, group in grouped:
+    for name, group in grouped: #name is name of the sentence in materials, group = sentence
 
         #print(name)
 
         stimulus = {}
         stimuli = []
-        old_utilitites = {}
      
-        y_position = 0 #to check if some text appears on the same screen or not
+        y_position = 0 #this will check if some text appears on the same screen or not
 
         freq = {}
 
         positions = {}
 
         lastwords = {} #storing last words in each line
+
+        #the following loop runs through a sentence word by word and creates a stimulus out of the sentence, recording the exact position; it also stores each word in decl. memory with the correct activation
 
         for idx, i in enumerate(group.index):
             if group.IA_TOP[i] < y_position:
@@ -163,6 +160,8 @@ def reading(grouped, rank, declchunks):
                 chunk_times = np.arange(start=-time_interval, stop=-(time_interval*word_freq)-1, step=-time_interval)
                 declchunks[actr.makechunk("", typename="word", form=word, cat=pos)] = math.log(np.sum((0-chunk_times) ** (-DECAY)))
             y_position = group.IA_TOP[i]
+
+        #the following 2 rules signal whether the reader should move to a new line or not depending on the x position
 
         for y in lastwords:
             tempstring = "\
@@ -215,6 +214,8 @@ def reading(grouped, rank, declchunks):
 
             parser.productionstring(name="move eyes to a new line" + y, string=tempstring)
 
+        #in the following part, the parser is made ready for reading - modules and buffers are initialized, focus is placed on the 1st word in sentence
+
         stimuli.append(stimulus)
 
         parser.decmems = {}
@@ -240,34 +241,37 @@ def reading(grouped, rank, declchunks):
                 isa     parsing
                 top     None"""))
         parser.goals["g2"].delay = 0.2
-    
+
+        #simulation is started
         sim = parser.simulation(realtime=False, trace=False, gui=True, environment_process=environment.environment_process, stimuli=stimuli, triggers='A', times=100)
-    
+
+        #variables that are used in recording eye fixation times are initialized    
         last_time = 0
-    
         cf = tuple(environment.current_focus)
-
-        first_word = True
-
         generated_list = []
 
+        #we'll run a loop in which we proceed event by event; we record eye fixation times (by recording the time until cf (eye focus) changes)); any break signals the end of simulation; break could arise not only when the sentence is finished; it could also arise if something went wrong, e.g., if time was higher than 100 seconds (if, for example, parameter values were very high) or if deck of events got empty
         while True:
-                if sim.show_time() > 100:
-                    generated_list = [len(group.WORD) - 2] + [0] * (len(group.WORD) - 2) #0 if getting stuck
-                    break
-                try:
-                    sim.step()
-                except (EmptySchedule, OverflowError):
-                    generated_list = [len(group.WORD) - 2] + [10000] * (len(group.WORD) - 2) #10000 if not finishing or overflowing (too much time)
-                    break
-                if not positions:
-                    break
-                if cf[0] != environment.current_focus[0] or cf[1] != environment.current_focus[1]:
-                    positions[cf][1] = 1000*(sim.show_time() - last_time) #time in milliseconds
-                    last_time = sim.show_time()
-                    cf = tuple(environment.current_focus)
-                if cf == last_position:
-                    break
+            if sim.show_time() > 100:
+                generated_list = [len(group.WORD) - 2] + [0] * (len(group.WORD) - 2) #0 if getting stuck
+                break
+            try:
+                #next event
+                sim.step()
+                #print(sim.current_event)
+            except (EmptySchedule, OverflowError):
+                generated_list = [len(group.WORD) - 2] + [10000] * (len(group.WORD) - 2) #10000 if not finishing or overflowing (too much time)
+                break
+            if not positions:
+                break
+            if cf[0] != environment.current_focus[0] or cf[1] != environment.current_focus[1]:
+                positions[cf][1] = 1000*(sim.show_time() - last_time) #time in milliseconds
+                last_time = sim.show_time()
+                cf = tuple(environment.current_focus)
+            if cf == last_position:
+                break
+
+        #after simulation, we collect eye fixation times in a simple list that can be transferred using MPI
         if not generated_list:
             ordered_keys = sorted(list(positions), key=lambda x:positions[x][0]) #keys ordered from first word to last word
             generated_list = [len(group.WORD)-2] + [positions[x][1] for x in ordered_keys][1:-1] #first and last words ignored
@@ -276,19 +280,22 @@ def reading(grouped, rank, declchunks):
         sent_list = np.array(generated_list, dtype=np.float)
         comm.Send([sent_list, MPI.FLOAT], dest=0, tag=1)
 
+    #when we are done with all simulations, we send info to the master
     comm.Send(bytearray('DONE', 'utf-8'), dest=0, tag=0)
 
     return declchunks
 
 def repeated_reading(grouped, rank):
     """
-    For slaves: when receiving True from master, start reading.
+    Function for slaves: when receiving True from master, start reading.
     """
 
-    declchunks = {} #storing chunks, moved later to decl. mem
+    declchunks = {} #this variable stores all chunks in declarative memory; this speeds up simulation since words that were created once do not have to be re-created again
 
     while True:
         received_list = np.empty(3, dtype=np.float)
+
+        #the slave receives information about three parameters from the master and uploads the parser model accordingly
         comm.Recv([received_list, MPI.FLOAT], 0, rank)
         if received_list[0] == -1:
             break
@@ -299,13 +306,9 @@ def repeated_reading(grouped, rank):
 
 @as_op(itypes=[T.dscalar, T.dscalar, T.dscalar, T.dscalar, T.dscalar], otypes=[T.dvector])
 def model(lf, le, emap, intercept, sigma):
-    global COUNT
-
-    PARAM_DICT.setdefault('lf', []).append(float(lf))
-    PARAM_DICT.setdefault('le', []).append(float(le))
-    PARAM_DICT.setdefault('emap', []).append(float(emap))
-    PARAM_DICT.setdefault('intercept', []).append(float(intercept))
-    PARAM_DICT.setdefault('sigma', []).append(float(sigma))
+    """
+    Workings of the model, run by the master that distributes the work to the slaves.
+    """
 
     sent_list = np.array([lf, le, emap], dtype = np.float)
 
@@ -315,6 +318,7 @@ def model(lf, le, emap, intercept, sigma):
     
     value_dict = {}
     skipped = set()
+
     #collect from slaves
     while True:
         if len(skipped) == comm.Get_size() - 1:
@@ -337,23 +341,18 @@ def model(lf, le, emap, intercept, sigma):
             comm.Recv([received_list, MPI.FLOAT], i, 1)
             value_dict[name] = received_list[1:int(received_list[0])+1]
 
-    #print("SIMULATED SENTENCES", len(value_dict))
+    return np.array([val for x in sorted(sorted(value_dict.keys(), key=lambda x:int(x[2:])), key=lambda x:int(x[0])) for val in value_dict[x] ]) #reorder sample in the right way -- x[2:] order sentences; x[0] order parts of et file
 
-    if COUNT % 100 == 0:
-        print(PARAM_DICT)
-
-    COUNT += 1
-
-    return np.array([val for x in sorted(sorted(value_dict.keys(), key=lambda x:int(x[2:])), key=lambda x:int(x[0])) for val in value_dict[x] ]) #reorder sample in the right way -- x[2:] order sentences; x[0] order parts of et file (it has 4 parts)
+##########EXECUTION FROM HERE ON###############
 
 worksheet = load_file(MATERIALS)
 data = load_file(DATA)
 data_sen_id = list(data.SENTENCE_ID)
 
-Y = data.RT
+Y = data.RT #We record actual reaction times as a vector
 
-worksheet = worksheet.groupby('SENTENCE_ID', sort=False).filter(lambda x:x['SENTENCE_ID'].iloc[0] in data_sen_id) #delete sentences that are not used later
-
+#materials has all sentences, but we use only a subset for param estimation; so select only the relevant subset
+worksheet = worksheet.groupby('SENTENCE_ID', sort=False).filter(lambda x:x['SENTENCE_ID'].iloc[0] in data_sen_id) 
 sentences = [x for x, _ in worksheet.groupby('SENTENCE_ID', sort=False)]
 
 n_sentences = len(sentences)
@@ -364,16 +363,13 @@ rank = comm.Get_rank()
 N_GROUPS = comm.Get_size() - 1 #Groups used for simulation - one less than used cores
 
 if rank == 0: #master
-    NDRAWS = int(sys.argv[1])
-    CHAIN = int(sys.argv[2])
-
     print("CHAIN ", CHAIN)
     print("DRAWS", NDRAWS)
 
-    PARAM_DICT = {}
-
-    print(n_sentences)
+    print("How many sentences used?", n_sentences)
     basic_model = Model()
+
+    #Below we specify the Bayesian model
     with basic_model:
 
         #Priors
@@ -393,7 +389,6 @@ if rank == 0: #master
         Normal('Y_obs', mu=mu, sd=50, observed=Y)
 
         step = Metropolis(basic_model.vars)
-        #step = Slice(basic_model.vars)
 
         trace = sample(NDRAWS, step=step, njobs=1, init='auto', tune=100)
 
@@ -409,6 +404,7 @@ if rank == 0: #master
         comm.Send([sent_list, MPI.FLOAT], dest=i, tag=i)
 
 else: #slave
+    #the following part selects sentences that will be used for each slave
     left = round((rank-1)*n_sentences/N_GROUPS)
     right = round(rank*n_sentences/N_GROUPS)
     if right != n_sentences:
